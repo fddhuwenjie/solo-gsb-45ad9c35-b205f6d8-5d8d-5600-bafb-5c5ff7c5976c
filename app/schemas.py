@@ -68,6 +68,31 @@ VIOLATION_DILUTION_CONCENTRATION_UNACHIEVABLE = "DILUTION_CONCENTRATION_UNACHIEV
 VIOLATION_DILUTION_ROUNDING_NO_GRID_SOLUTION = "DILUTION_ROUNDING_NO_GRID_SOLUTION"
 VIOLATION_DILUTION_ROUNDING_TOLERANCE_EXCEEDED = "DILUTION_ROUNDING_TOLERANCE_EXCEEDED"
 
+# ---------------------------------------------------------------------------
+# Release certificates: statuses, revocation reasons and conflict categories.
+# ---------------------------------------------------------------------------
+
+# Certificate lifecycle statuses.
+CERT_STATUS_RELEASED = "RELEASED"
+CERT_STATUS_REVOKED = "REVOKED"
+
+# First failure reason recorded when a re-verification revokes a certificate.
+CERT_REASON_SCAN_MISMATCH = "SCAN_MISMATCH"
+CERT_REASON_SPATIAL_QC_FAILED = "SPATIAL_QC_FAILED"
+CERT_REASON_VIEW_CHANGED = "VIEW_CHANGED"
+
+# Categories for malformed certificate requests (HTTP 422).
+VIOLATION_CERT_VIEW_INVALID = "CERT_VIEW_INVALID"
+
+# Categories for request-key / state conflicts (HTTP 409).
+CERT_CONFLICT_REQUEST_KEY_REUSED = "REQUEST_KEY_REUSED"
+CERT_CONFLICT_BATCH_ALREADY_CERTIFIED = "BATCH_ALREADY_CERTIFIED"
+CERT_CONFLICT_REVISION_MISMATCH = "REVISION_MISMATCH"
+CERT_CONFLICT_CERTIFICATE_REVOKED = "CERTIFICATE_REVOKED"
+
+# Category for an unknown certificate / batch (HTTP 404).
+CERT_NOT_FOUND = "CERTIFICATE_NOT_FOUND"
+
 
 class PlateSpec(BaseModel):
     """Plate geometry.
@@ -447,4 +472,71 @@ class DilutionPlanRequest(BaseModel):
     def _finite_positive(cls, v: float) -> float:
         if not math.isfinite(v):
             raise ValueError("must be a finite number")
+        return v
+
+
+class CertificateCreateRequest(BatchReleaseRequest):
+    """Create a release certificate for a batch.
+
+    The body is a full batch-release verification request (stage-1 scan
+    agreement plus stage-2 spatial QC gates) together with:
+
+    * ``batch_id`` — the certified production batch; at most one live
+      certificate may exist per batch;
+    * ``request_key`` — a client-chosen idempotency key; replaying the exact
+      same request with the same key returns the stored response, while the
+      same key with different content is rejected with 409;
+    * ``view`` — an optional blinded operational view (``well`` +
+      ``blind_id`` only). Only a *summary* of the view (entry count and a
+      digest) is ever persisted: no key shares and no plaintext blind
+      correspondence are stored.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1, description="批次标识;每个批次至多一份有效证书")
+    request_key: str = Field(
+        min_length=1, description="幂等键:同键同内容重放,同键换内容返回 409"
+    )
+    view: Optional[list[BlindViewEntry]] = Field(
+        default=None,
+        description="可选盲化操作视图(仅 well + blind_id);证书只保存其摘要",
+    )
+
+
+class CertificateReverifyRequest(BaseModel):
+    """Re-verify an existing release certificate against a fresh scan.
+
+    Everything except ``batch_id``, ``expected_revision``, the new
+    ``scan``/``readings`` and the optional ``view`` is restored from the
+    certificate's frozen snapshot (plate, target layout, blocked wells,
+    samples, seed and every spatial QC threshold). Success atomically
+    appends a new revision; any scan disagreement, failed QC gate or changed
+    view summary revokes the certificate irreversibly. ``request_key`` makes
+    the re-verification replayable with the same exact content.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1, description="证书对应的批次标识")
+    request_key: str = Field(min_length=1, description="幂等键:同键同内容重放,同键换内容返回 409")
+    expected_revision: int = Field(ge=1, description="调用方持有的当前 revision;不匹配返回 409")
+    scan: dict[str, str] = Field(
+        default_factory=dict, description="新的完整扫描:孔位 → 样本 id(空孔不列出)"
+    )
+    readings: dict[str, Optional[float]] = Field(
+        default_factory=dict,
+        description="新的孔位 → 数值读数;省略孔位或显式 null 表示读数缺失",
+    )
+    view: Optional[list[BlindViewEntry]] = Field(
+        default=None,
+        description="可选盲化操作视图;其摘要必须与冻结摘要一致,否则证书被撤销",
+    )
+
+    @field_validator("readings")
+    @classmethod
+    def _readings_finite(cls, v: dict[str, Optional[float]]) -> dict[str, Optional[float]]:
+        for well, value in v.items():
+            if value is not None and not math.isfinite(value):
+                raise ValueError(f"reading at well '{well}' must be a finite number or null")
         return v

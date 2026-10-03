@@ -11,10 +11,27 @@ from .metrics import compute_spreads, count_adjacent_pairs, verify_layout
 from .planner import InfeasibleArrangement, SolverTimeout, plan_layout
 from .plates import parse_well
 from .blinding import BlindInvalid, blind, unblind
+from .certificates import (
+    CertificateConflict,
+    CertificateInvalid,
+    CertificateMissing,
+    create_certificate,
+    reverify_certificate,
+)
 from .dilution import DilutionPlanInvalid, dilution_plan
 from .reconciler import ReconcileInvalid, StagingConflict, reconcile
 from .release import ReleaseInvalid, batch_release
-from .schemas import ArrangeRequest, BatchReleaseRequest, BlindRequest, DilutionPlanRequest, ReconcileRequest, SpatialQCRequest, UnblindRequest
+from .schemas import (
+    ArrangeRequest,
+    BatchReleaseRequest,
+    BlindRequest,
+    CertificateCreateRequest,
+    CertificateReverifyRequest,
+    DilutionPlanRequest,
+    ReconcileRequest,
+    SpatialQCRequest,
+    UnblindRequest,
+)
 from .spatial_qc import SpatialQCInvalid, spatial_qc
 
 app = FastAPI(
@@ -169,6 +186,54 @@ async def dilution_invalid_handler(request: Request, exc: DilutionPlanInvalid) -
     )
 
 
+@app.exception_handler(CertificateInvalid)
+async def certificate_invalid_handler(request: Request, exc: CertificateInvalid) -> JSONResponse:
+    # 422 for malformed certificate input (bad plate geometry, an invalid
+    # operational view, or structurally unusable fresh readings on
+    # re-verification). No certificate state ever changes on this path.
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "The release certificate request is invalid; "
+            "no certificate was created or modified.",
+            "infeasibility_categories": exc.categories,
+            "messages": exc.messages,
+            "misplaced_wells": exc.misplaced_wells,
+            "cycles": exc.cycles,
+        },
+    )
+
+
+@app.exception_handler(CertificateConflict)
+async def certificate_conflict_handler(request: Request, exc: CertificateConflict) -> JSONResponse:
+    # 409: request_key reuse with different content, stale expected_revision,
+    # an already-certified batch, or any operation on a REVOKED certificate.
+    content = {
+        "detail": exc.message,
+        "conflict": exc.category,
+    }
+    if exc.certificate_id is not None:
+        content["certificate_id"] = exc.certificate_id
+    if exc.status is not None:
+        content["status"] = exc.status
+    if exc.current_revision is not None:
+        content["current_revision"] = exc.current_revision
+    return JSONResponse(status_code=409, content=content)
+
+
+@app.exception_handler(CertificateMissing)
+async def certificate_missing_handler(request: Request, exc: CertificateMissing) -> JSONResponse:
+    # 404: no certificate exists for the submitted batch id.
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": f"No release certificate exists for batch '{exc.batch_id}'.",
+            "conflict": "CERTIFICATE_NOT_FOUND",
+            "batch_id": exc.batch_id,
+        },
+    )
+
+
 @app.get("/", include_in_schema=False)
 async def root() -> RedirectResponse:
     return RedirectResponse(url="/docs")
@@ -310,6 +375,37 @@ async def spatial_qc_arrangement(req: SpatialQCRequest) -> dict:
 )
 async def batch_release_arrangement(req: BatchReleaseRequest) -> dict:
     return batch_release(req)
+
+
+@app.post(
+    "/api/v1/certificates",
+    summary="为通过批次放行核验的批次建立放行证书(RELEASED 时原子落盘)",
+    status_code=201,
+    responses={
+        201: {"description": "放行通过:在同一 SQLite 事务保存 layout/scan/readings/阈值/视图摘要,返回 certificate_id、status、revision、digest"},
+        200: {"description": "空间质控门控未过:verdict=NOT_RELEASED,不创建证书(该结论按 request_key 可重放)"},
+        409: {"description": "request_key 换内容重放,或批次已有证书(含已撤销)"},
+        422: {"description": "扫描与计划不一致、请求结构非法或视图非法;不创建证书"},
+    },
+)
+async def create_release_certificate(req: CertificateCreateRequest):
+    status_code, body = create_certificate(req)
+    return JSONResponse(status_code=status_code, content=body)
+
+
+@app.post(
+    "/api/v1/certificates/reverify",
+    summary="凭冻结快照重核验证书:通过则原子递增 revision,否则不可逆地撤销",
+    responses={
+        200: {"description": "status=RELEASED(revision 原子递增)或 status=REVOKED(给出首个失效原因)"},
+        404: {"description": "batch_id 无对应证书"},
+        409: {"description": "request_key 换内容、expected_revision 过期或证书已撤销(不可恢复)"},
+        422: {"description": "新提交证据结构非法(如读数引用非法孔位)或视图结构非法;证书状态不变"},
+    },
+)
+async def reverify_release_certificate(req: CertificateReverifyRequest):
+    status_code, body = reverify_certificate(req)
+    return JSONResponse(status_code=status_code, content=body)
 
 
 @app.post(

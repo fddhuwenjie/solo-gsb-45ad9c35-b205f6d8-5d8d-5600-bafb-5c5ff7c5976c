@@ -10,6 +10,10 @@ services:
       CP_NUM_WORKERS: "1"
       CP_DETERMINISTIC_TIME_SECONDS: "4"
       CP_WALL_TIME_SECONDS: "12"
+      # 放行证书 SQLite 数据库路径;通过命名卷持久化,容器重建不丢证书
+      CERT_DB_PATH: "/data/certificates.db"
+    volumes:
+      - certificate-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"]
@@ -17,3 +21,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+volumes:
+  certificate-data:
