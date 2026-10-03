@@ -57,6 +57,19 @@ VIOLATION_BLIND_SHARE_INVALID = "BLIND_SHARE_INVALID"
 VIOLATION_BLIND_PACKAGE_INVALID = "BLIND_PACKAGE_INVALID"
 VIOLATION_BLIND_INTEGRITY_FAILED = "BLIND_INTEGRITY_FAILED"
 
+# Categories and error codes reported by the batch certificate endpoints.
+# ``CERTIFICATE_VIEW_INVALID`` appears in 422 ``infeasibility_categories``;
+# the ``CERT_*``/``REQUEST_KEY_CONFLICT`` codes appear as ``error`` in 404/409
+# bodies; ``REVOCATION_VIEW_DIGEST_MISMATCH`` is a revocation reason stored on
+# the certificate and returned by re-verification.
+VIOLATION_CERTIFICATE_VIEW_INVALID = "CERTIFICATE_VIEW_INVALID"
+CERTIFICATE_NOT_FOUND = "CERTIFICATE_NOT_FOUND"
+CERTIFICATE_ALREADY_EXISTS = "CERTIFICATE_ALREADY_EXISTS"
+CERTIFICATE_REVOKED = "CERTIFICATE_REVOKED"
+CERTIFICATE_REVISION_MISMATCH = "CERTIFICATE_REVISION_MISMATCH"
+REQUEST_KEY_CONFLICT = "REQUEST_KEY_CONFLICT"
+REVOCATION_VIEW_DIGEST_MISMATCH = "VIEW_DIGEST_MISMATCH"
+
 # Categories reported in 422 responses of the dilution-plan endpoint when no
 # pipetting plan can satisfy every target well; no partial plan is emitted.
 VIOLATION_DILUTION_TARGET_WELLS_DUPLICATED = "DILUTION_TARGET_WELLS_DUPLICATED"
@@ -447,4 +460,82 @@ class DilutionPlanRequest(BaseModel):
     def _finite_positive(cls, v: float) -> float:
         if not math.isfinite(v):
             raise ValueError("must be a finite number")
+        return v
+
+
+class CertificateCreateRequest(BaseModel):
+    """Establish a certificate for a batch that passes release verification.
+
+    ``release`` is a batch release verification request with exactly the
+    structure of ``POST /api/v1/arrangements/batch-release``; the service
+    reuses the reconciliation rules and the spatial QC gates unchanged. Only
+    a ``RELEASED`` verdict is certified: the layout, scan, readings,
+    thresholds and the optional blinded-view digest are then frozen into a
+    SQLite snapshot in a single transaction. ``view`` is the blinded
+    operational view (well + blind_id) produced by ``POST /api/v1/blinding/blind``;
+    only its SHA-256 digest is stored — never the view itself, never key
+    shares, never the plaintext blind mapping.
+
+    ``request_key`` is the idempotency key: replaying the same key with
+    identical content returns the recorded response; the same key with
+    different content is rejected with 409.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1, description="批次标识;每个批次至多存在一份证书")
+    request_key: str = Field(
+        min_length=1, description="幂等键:同键同内容重放已记录响应,同键不同内容返回 409"
+    )
+    release: BatchReleaseRequest = Field(
+        description="批次放行核验请求(结构与 batch-release 接口相同)"
+    )
+    view: Optional[list[BlindViewEntry]] = Field(
+        default=None,
+        min_length=1,
+        description="可选的盲化操作视图(well + blind_id);仅保存其摘要,不保存视图本身",
+    )
+
+
+class CertificateReverifyRequest(BaseModel):
+    """Re-verify a certified batch with a fresh scan and fresh readings.
+
+    The plate, layout, samples, seed and thresholds are restored from the
+    frozen certificate snapshot; only ``scan``, ``readings`` and the optional
+    blinded operational ``view`` are supplied anew. ``expected_revision``
+    must equal the certificate's current revision (older revisions can never
+    be overwritten). If the batch still passes, the revision is incremented
+    atomically; any misplacement, QC failure or view-digest change marks the
+    certificate REVOKED and returns the first failure reason. A revoked
+    certificate can never be restored.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1, description="批次标识")
+    request_key: str = Field(
+        min_length=1, description="幂等键:同键同内容重放已记录响应,同键不同内容返回 409"
+    )
+    expected_revision: int = Field(
+        ge=1, description="期望的当前 revision;与证书当前值不一致时返回 409,旧 revision 不可覆盖"
+    )
+    scan: dict[str, str] = Field(
+        default_factory=dict, description="新的完整扫描:孔位 → 样本 id(空孔不列出)"
+    )
+    readings: dict[str, Optional[float]] = Field(
+        default_factory=dict,
+        description="新的孔位 → 数值读数;省略孔位或显式 null 表示读数缺失",
+    )
+    view: Optional[list[BlindViewEntry]] = Field(
+        default=None,
+        min_length=1,
+        description="可选的盲化操作视图;携带时其摘要必须与证书冻结摘要一致,否则吊销证书",
+    )
+
+    @field_validator("readings")
+    @classmethod
+    def _readings_finite(cls, v: dict[str, Optional[float]]) -> dict[str, Optional[float]]:
+        for well, value in v.items():
+            if value is not None and not math.isfinite(value):
+                raise ValueError(f"reading at well '{well}' must be a finite number or null")
         return v

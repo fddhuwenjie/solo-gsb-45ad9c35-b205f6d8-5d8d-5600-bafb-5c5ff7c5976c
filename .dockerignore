@@ -6,3 +6,4 @@ tests/
 *.md
 Dockerfile
 docker-compose.yml
+certificates.db*

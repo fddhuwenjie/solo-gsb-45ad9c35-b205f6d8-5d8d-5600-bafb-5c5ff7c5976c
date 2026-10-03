@@ -11,10 +11,11 @@ from .metrics import compute_spreads, count_adjacent_pairs, verify_layout
 from .planner import InfeasibleArrangement, SolverTimeout, plan_layout
 from .plates import parse_well
 from .blinding import BlindInvalid, blind, unblind
+from .certificates import create_certificate, reverify_certificate
 from .dilution import DilutionPlanInvalid, dilution_plan
 from .reconciler import ReconcileInvalid, StagingConflict, reconcile
-from .release import ReleaseInvalid, batch_release
-from .schemas import ArrangeRequest, BatchReleaseRequest, BlindRequest, DilutionPlanRequest, ReconcileRequest, SpatialQCRequest, UnblindRequest
+from .release import ReleaseInvalid, batch_release, release_invalid_body
+from .schemas import ArrangeRequest, BatchReleaseRequest, BlindRequest, CertificateCreateRequest, CertificateReverifyRequest, DilutionPlanRequest, ReconcileRequest, SpatialQCRequest, UnblindRequest
 from .spatial_qc import SpatialQCInvalid, spatial_qc
 
 app = FastAPI(
@@ -122,18 +123,7 @@ async def release_invalid_handler(request: Request, exc: ReleaseInvalid) -> JSON
     # open/closed-loop misplacement, blocked-well occupancy...) or the
     # spatial QC input is structurally unanalysable. The problem categories
     # and the misplaced-well list are returned; no release verdict is given.
-    return JSONResponse(
-        status_code=422,
-        content={
-            "detail": "The batch cannot be released; the scan does not match "
-            "the plan (or the request is inconsistent), and no release "
-            "conclusion was produced.",
-            "infeasibility_categories": exc.categories,
-            "messages": exc.messages,
-            "misplaced_wells": exc.misplaced_wells,
-            "cycles": exc.cycles,
-        },
-    )
+    return JSONResponse(status_code=422, content=release_invalid_body(exc))
 
 
 @app.exception_handler(BlindInvalid)
@@ -346,3 +336,33 @@ async def blind_layout(req: BlindRequest) -> dict:
 )
 async def unblind_layout(req: UnblindRequest) -> dict:
     return unblind(req)
+
+
+@app.post(
+    "/api/v1/certificates",
+    summary="为通过批次放行核验的批次建立证书(冻结快照,单一 SQLite 事务持久化)",
+    responses={
+        201: {"description": "放行通过(RELEASED),证书已建立,返回 certificate_id、status、revision 与 digest"},
+        200: {"description": "放行门控未通过(NOT_RELEASED),不建立证书"},
+        409: {"description": "批次已存在证书,或 request_key 曾被不同内容使用"},
+        422: {"description": "扫描与计划不一致、请求非法或盲化视图非法,不建立证书"},
+    },
+)
+async def create_batch_certificate(req: CertificateCreateRequest) -> JSONResponse:
+    status, body = create_certificate(req)
+    return JSONResponse(status_code=status, content=body)
+
+
+@app.post(
+    "/api/v1/certificates/reverify",
+    summary="证书重核验:凭冻结快照恢复参数,以新扫描/读数复核;通过则原子递增 revision,否则吊销",
+    responses={
+        200: {"description": "复核通过返回递增后的 revision;任何错位/质控失败/视图摘要变化返回 REVOKED 与首个失效原因"},
+        404: {"description": "批次无证书"},
+        409: {"description": "证书已吊销(不可恢复)、expected_revision 与当前 revision 不符,或 request_key 曾被不同内容使用"},
+        422: {"description": "请求非法或盲化视图结构非法,证书保持不变"},
+    },
+)
+async def reverify_batch_certificate(req: CertificateReverifyRequest) -> JSONResponse:
+    status, body = reverify_certificate(req)
+    return JSONResponse(status_code=status, content=body)

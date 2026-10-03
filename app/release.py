@@ -70,6 +70,23 @@ class ReleaseInvalid(Exception):
         super().__init__("; ".join(messages) if messages else "invalid batch release request")
 
 
+def release_invalid_body(exc: ReleaseInvalid) -> dict:
+    """Canonical 422 envelope for a stage-1/structural release failure.
+
+    Shared by the batch-release endpoint's exception handler and the batch
+    certificate endpoint so both emit the identical body shape.
+    """
+    return {
+        "detail": "The batch cannot be released; the scan does not match "
+        "the plan (or the request is inconsistent), and no release "
+        "conclusion was produced.",
+        "infeasibility_categories": exc.categories,
+        "messages": exc.messages,
+        "misplaced_wells": exc.misplaced_wells,
+        "cycles": exc.cycles,
+    }
+
+
 def _best_effort_misplaced(req: BatchReleaseRequest, rows: int, cols: int) -> list[dict]:
     """Misplaced-well list reconstructed without relying on a clean preflight.
 

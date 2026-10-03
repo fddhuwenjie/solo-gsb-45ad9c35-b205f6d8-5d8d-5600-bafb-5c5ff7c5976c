@@ -30,6 +30,8 @@ docker compose up --build
 - 稀释梯度配制计划： `POST http://localhost:8000/api/v1/arrangements/dilution-plan`
 - 双人协作盲化： `POST http://localhost:8000/api/v1/blinding/blind`
 - 双人协作解盲： `POST http://localhost:8000/api/v1/blinding/unblind`
+- 批次证书建立： `POST http://localhost:8000/api/v1/certificates`
+- 证书重核验： `POST http://localhost:8000/api/v1/certificates/reverify`
 
 不使用 Docker 时（Python 3.11+):
 
@@ -545,6 +547,199 @@ curl -X POST http://localhost:8000/api/v1/arrangements/batch-release \
 }
 ```
 
+## 批次证书 `POST /api/v1/certificates`
+
+为**通过批次放行核验**的批次建立证书。请求由 `batch_id`、`request_key`、完整的
+放行请求 `release`（结构与批次放行核验接口完全相同）与可选的盲化操作视图 `view`
+（盲化接口返回的 well + blind_id 操作视图）组成。服务**复用纠位规则与空间质控
+门控**,**只有 `verdict = "RELEASED"` 才会建立证书**：计划 layout(`target`)、scan、
+readings、样本分组、seed、全部阈值（`max_spatial_effect`/`min_p_value`/
+`permutations`/`tolerance`/`max_iterations`）与**视图摘要**在**同一 SQLite 事务**
+中原子写入冻结快照，返回 `certificate_id`、`status`、`revision`（恒为 1）与覆盖
+整个快照的内容 `digest`(SHA-256)。每个批次至多存在一份证书。
+
+端口 `8000` 调用示例：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/certificates \
+  -H "Content-Type: application/json" \
+  -d '{
+    "batch_id": "B2026-0042",
+    "request_key": "crt-9f3a-0001",
+    "release": {
+      "plate": {"type": "24"},
+      "target": {
+        "S1": "A1", "S2": "A2", "S3": "B1", "S4": "B2",
+        "S5": "C1", "S6": "C2", "S7": "D1", "S8": "D2"
+      },
+      "scan": {
+        "A1": "S1", "A2": "S2", "B1": "S3", "B2": "S4",
+        "C1": "S5", "C2": "S6", "D1": "S7", "D2": "S8"
+      },
+      "samples": [
+        {"id": "S1", "group": "treated"}, {"id": "S2", "group": "control"},
+        {"id": "S3", "group": "treated"}, {"id": "S4", "group": "control"},
+        {"id": "S5", "group": "treated"}, {"id": "S6", "group": "control"},
+        {"id": "S7", "group": "treated"}, {"id": "S8", "group": "control"}
+      ],
+      "readings": {
+        "A1": 1.05, "A2": 0.98, "B1": 1.02, "B2": 1.01,
+        "C1": 1.04, "C2": 0.99, "D1": 1.03, "D2": 1.00
+      },
+      "seed": 42,
+      "max_spatial_effect": 0.5,
+      "min_p_value": 0.05,
+      "permutations": 1000
+    },
+    "view": [
+      {"well": "A1", "blind_id": "BL-9f2c01ab77e4"},
+      {"well": "A2", "blind_id": "BL-51bd0e8a2c90"}
+    ]
+  }'
+```
+
+### 建立证书请求字段
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `batch_id` | string | 批次标识；每个批次至多存在一份证书（吊销后也不可重建） |
+| `request_key` | string | **幂等键**：同键同内容重放已记录响应，同键不同内容返回 409 |
+| `release` | object | 批次放行核验请求，字段与 `POST /api/v1/arrangements/batch-release` 完全相同 |
+| `view[]` | array | 可选的盲化操作视图，每项 `{well, blind_id}`;**只保存其 SHA-256 摘要，不保存视图本身** |
+
+### 建立成功（201,`status = "ACTIVE"`)
+
+```json
+{
+  "certificate_id": "cert-21c5d55aee34528c617180cf",
+  "batch_id": "B2026-0042",
+  "status": "ACTIVE",
+  "revision": 1,
+  "digest": "237699a01001fa68...",
+  "view_digest": "8c4f2ab19d..."
+}
+```
+
+未携带 `view` 时 `view_digest` 为 `null`。其余结果：
+
+| 状态码 | 情形 |
+| --- | --- |
+| 200 | 放行门控未通过：`status = "NOT_CERTIFIED"`，附 `verdict`/`reasons`/`gates`/`thresholds`,**不建立证书** |
+| 409 | 批次已有证书（`error = "CERTIFICATE_ALREADY_EXISTS"`，含现有 `certificate_id` 与 `status`)，或 `request_key` 曾被不同内容使用（`error = "REQUEST_KEY_CONFLICT"`) |
+| 422 | 扫描与计划不一致或请求非法（响应包络与批次放行核验接口的 422 完全一致），或视图结构非法（`CERTIFICATE_VIEW_INVALID` / `WELL_REFERENCE_INVALID`);**不建立证书** |
+
+## 证书重核验 `POST /api/v1/certificates/reverify`
+
+凭 `batch_id`、`expected_revision` 与**新的** `scan`/`readings`（可带视图）复核已获证
+批次：板型、计划 layout、样本分组、seed 与全部阈值从**冻结快照**恢复，重新执行与
+建立时完全相同的两级放行核验（纠位规则 + 空间质控门控）。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/certificates/reverify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "batch_id": "B2026-0042",
+    "request_key": "rv-9f3a-0007",
+    "expected_revision": 1,
+    "scan": {
+      "A1": "S1", "A2": "S2", "B1": "S3", "B2": "S4",
+      "C1": "S5", "C2": "S6", "D1": "S7", "D2": "S8"
+    },
+    "readings": {
+      "A1": 1.06, "A2": 0.97, "B1": 1.03, "B2": 1.00,
+      "C1": 1.04, "C2": 0.99, "D1": 1.02, "D2": 1.01
+    },
+    "view": [
+      {"well": "A1", "blind_id": "BL-9f2c01ab77e4"},
+      {"well": "A2", "blind_id": "BL-51bd0e8a2c90"}
+    ]
+  }'
+```
+
+### 重核验请求字段
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `batch_id` | string | 批次标识 |
+| `request_key` | string | **幂等键**，规则同建立接口 |
+| `expected_revision` | int | 期望的当前 revision(≥1)；与证书当前值不符返回 409,**旧 revision 不可覆盖** |
+| `scan` | object | 新的完整扫描：孔位 → 样本 id，空孔不列出 |
+| `readings` | object | 新的孔位 → 数值读数；省略或 `null` 表示缺失；`NaN`/`Infinity` 不允许 |
+| `view[]` | array | 可选的盲化操作视图；携带时其摘要必须与证书冻结摘要一致 |
+
+### 复核通过（200,revision 原子递增）
+
+```json
+{
+  "certificate_id": "cert-21c5d55aee34528c617180cf",
+  "batch_id": "B2026-0042",
+  "status": "ACTIVE",
+  "revision": 2,
+  "digest": "237699a01001fa68...",
+  "view_digest": "8c4f2ab19d..."
+}
+```
+
+`digest`/`view_digest` 与建立时一致（冻结快照不随 revision 改变）。
+
+### 复核失败（200,`status = "REVOKED"`，返回首个失效原因）
+
+**任何错位、质控失败或视图摘要变化**都会把证书立即标为 `REVOKED` 并返回**首个
+失效原因**;revision 不递增：
+
+```json
+{
+  "certificate_id": "cert-21c5d55aee34528c617180cf",
+  "batch_id": "B2026-0042",
+  "status": "REVOKED",
+  "revision": 1,
+  "digest": "237699a01001fa68...",
+  "revocation": {
+    "reason": "CLOSED_LOOP_MISPLACEMENT",
+    "messages": ["scan contains 1 closed-loop misplacement cycle(s): A1 -> A2", "..."],
+    "misplaced_wells": [
+      {"well": "A1", "expected": "S1", "actual": "S2"},
+      {"well": "A2", "expected": "S2", "actual": "S1"}
+    ],
+    "cycles": [["A1", "A2"]]
+  }
+}
+```
+
+`revocation.reason` 取值为放行核验的首个失败类别/原因（如 `SAMPLES_MISSING`、
+`UNPLANNED_SAMPLES`、`CLOSED_LOOP_MISPLACEMENT`、`SCAN_LAYOUT_MISMATCH`、
+`SPATIAL_EFFECT_EXCEEDED`、`P_VALUE_BELOW_THRESHOLD`、`P_VALUE_UNAVAILABLE`、
+`SPATIAL_NOT_CONVERGED` 等）或 `VIEW_DIGEST_MISMATCH`（携带视图的摘要与证书
+冻结摘要不符）。
+
+### 其余重核验结果
+
+| 状态码 | 情形 |
+| --- | --- |
+| 404 | 批次无证书（`error = "CERTIFICATE_NOT_FOUND"`) |
+| 409 | 证书已吊销（`error = "CERTIFICATE_REVOKED"`,**吊销不可恢复**，附 `revoked_reason`);`expected_revision` 与当前 revision 不符（`error = "CERTIFICATE_REVISION_MISMATCH"`，附 `current_revision`);`request_key` 曾被不同内容使用（`error = "REQUEST_KEY_CONFLICT"`) |
+| 422 | 请求结构非法（`REQUEST_VALIDATION_ERROR`）或视图结构非法（`CERTIFICATE_VIEW_INVALID` / `WELL_REFERENCE_INVALID`);**证书保持不变** |
+
+### 幂等与 `request_key`
+
+两个证书接口都以 `request_key` 为幂等键：
+
+- **同键同内容重放**：返回已记录的响应（状态码与响应体完全一致）——网络重试
+  不会造成重复建证、重复递增 revision 或重复吊销；
+- **同键不同内容**：返回 409 `REQUEST_KEY_CONFLICT`，原记录不受影响；
+- 证书写入、吊销、revision 递增与幂等记录都在**同一 SQLite 事务**中提交；
+- 与批次状态相关的拒绝（404 无证书、409 已吊销/已有证书/revision 不符）**不占用**
+  `request_key`，修正状态后可用同键重试。
+
+### 证书安全
+
+- 证书**只保存盲化操作视图的 SHA-256 摘要**，不保存视图本身；**绝不保存密钥
+  份额或明文映射**（份额与 blind_id ↔ sample_id 对应关系从不进入证书存储）;
+- `digest` 覆盖冻结快照的全部内容（批次、板型、layout、scan、readings、样本
+  分组、seed、阈值与视图摘要），可用于独立审计比对；
+- 数据库路径由 `CERT_DB_PATH` 配置（默认 `./certificates.db`;Docker Compose
+  将其设为 `/data/certificates.db` 并挂载命名卷持久化）。
+
 ## 稀释梯度配制计划 `POST /api/v1/arrangements/dilution-plan`
 
 为**既有编排结果**（编排接口响应中的 `layout`，即 sample_id → well 映射）
@@ -880,6 +1075,9 @@ curl -X POST http://localhost:8000/api/v1/blinding/unblind \
 - 稀释梯度配制计划是纯算术规划(无随机源):目标孔按行主序处理,容差内
   网格点以"最接近理想抽取量、居中取较小值"唯一决胜,来源按 id 排序,
   相同输入必然得到逐字节相同的指令、实际浓度与来源余量。
+- 批次证书完全复用上述放行核验:相同（放行请求， 视图）必然得到相同的
+  冻结快照与内容 `digest`;证书状态（`revision`/`REVOKED`）由 SQLite
+  事务保证单调推进——revision 只增不减，吊销不可逆。
 
 ## 配置（环境变量）
 
@@ -890,6 +1088,7 @@ curl -X POST http://localhost:8000/api/v1/blinding/unblind \
 | `CP_WALL_TIME_SECONDS` | `12` | 每个优化阶段的墙钟时间硬上限（安全阀） |
 | `CP_FAST_DETERMINISTIC_TIME_SECONDS` | `1` | 快速保底/决胜阶段的确定性预算 |
 | `CP_FAST_WALL_TIME_SECONDS` | `8` | 快速保底/决胜阶段的墙钟上限 |
+| `CERT_DB_PATH` | `./certificates.db` | 批次证书 SQLite 数据库路径（Docker Compose 中为 `/data/certificates.db`，挂载命名卷 `microplate-data` 持久化） |
 
 预算耗尽时返回当前最优可行解（`solver.status = FEASIBLE`)，两级指标仍是
 字典序意义下预算内最优；找不到任何可行解时返回 503（不返回部分布局）。
@@ -905,17 +1104,18 @@ pytest tests -q
 
 ```
 app/
-  main.py      FastAPI 应用与异常处理（200/409/422/503)
+  main.py      FastAPI 应用与异常处理（200/201/404/409/422/503)
   schemas.py   请求/响应模型与不可行类别常量
   planner.py   三阶段字典序 CP-SAT 求解（平衡 → 邻接 → 确定性决胜）
   reconciler.py 扫描核对与最少步数纠位指令生成（空孔链 → 闭环暂存）
   spatial_qc.py 组中位数中心化 + 行列中位数剥离（median polish）与组内置换检验
   release.py   批次放行两级门控:扫描吻合核验（复用纠位规则）→ 空间质控放行门
+  certificates.py 批次证书:放行结果冻结快照（SQLite 单事务）、重核验原子递增/吊销、request_key 幂等
   dilution.py  稀释梯度配制:共享库存核算 + 分辨率取整 + 容差校验,确定性逐步移液指令
   blinding.py  双人协作盲化/解盲:AES-256-GCM 认证加密映射包 + XOR 双份额
   metrics.py   指标独立重算与布局约束校验
   plates.py    板型预设与孔位命名解析
-tests/         pytest 测试（解析、求解、API、纠位、空间质控、批次放行、稀释计划、盲化解盲）
+tests/         pytest 测试（解析、求解、API、纠位、空间质控、批次放行、批次证书、稀释计划、盲化解盲）
 Dockerfile     单容器构建
-docker-compose.yml  单命令启动
+docker-compose.yml  单命令启动（含证书数据库命名卷）
 ```
